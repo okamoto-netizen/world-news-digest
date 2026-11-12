@@ -32,25 +32,37 @@ CHANNELS = {
 VOICE = "ja-JP-NanamiNeural"
 PLAYER_URL = "https://okamoto-netizen.github.io/world-news-digest/"
 
-def fetch_transcript_text(video_id):
-    """動画の冒頭約90秒分の字幕テキストを取得する"""
+def fetch_full_transcript(video_id):
+    """動画全体（最大約6分・4500文字分）の字幕テキストをしっかり取得する"""
     try:
         transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
         transcript = next(iter(transcript_list))
         fetched = transcript.fetch()
-        lines = [item["text"] for item in fetched if item["start"] <= 90.0]
-        return " ".join(lines)[:1200]
+        # 最初の約360秒（6分間）の字幕をすべて結合
+        lines = [item["text"] for item in fetched if item["start"] <= 360.0]
+        full_text = " ".join(lines).strip()
+        return full_text[:4500]
     except Exception:
         return None
 
-def translate_to_japanese(text):
-    try:
-        return GoogleTranslator(source="auto", target="ja").translate(text)
-    except Exception:
-        return text
+def translate_long_text(text):
+    """長文を1,500文字ずつに分割して確実に日本語へ翻訳する"""
+    if not text:
+        return ""
+    chunks = [text[i:i+1500] for i in range(0, len(text), 1500)]
+    translated_parts = []
+    for chunk in chunks:
+        try:
+            res = GoogleTranslator(source="auto", target="ja").translate(chunk)
+            if res:
+                translated_parts.append(res)
+        except Exception:
+            translated_parts.append(chunk)
+    return "".join(translated_parts)
 
 async def generate_audio(script_text, output_path):
-    communicate = edge_tts.Communicate(script_text, VOICE, rate="+10%")
+    # 情報量が増えるため、聞き取りやすくテンポの良い +15% 速度に設定
+    communicate = edge_tts.Communicate(script_text, VOICE, rate="+15%")
     await communicate.save(output_path)
 
 def build_player_html(today_str, news_items):
@@ -73,7 +85,7 @@ def build_player_html(today_str, news_items):
     button.secondary {{ background: #333; }}
     button:hover {{ opacity: 0.9; }}
     .now-playing {{ font-size: 0.95rem; color: #ff8a80; font-weight: bold; margin-bottom: 8px; }}
-    .script-box {{ background: #1e1e1e; padding: 12px; border-radius: 8px; font-size: 0.9rem; line-height: 1.6; color: #ddd; margin-bottom: 16px; max-height: 140px; overflow-y: auto; }}
+    .script-box {{ background: #1e1e1e; padding: 14px; border-radius: 8px; font-size: 0.95rem; line-height: 1.7; color: #eee; margin-bottom: 16px; max-height: 220px; overflow-y: auto; }}
     .playlist {{ list-style: none; padding: 0; margin: 0; }}
     .playlist li {{ background: #1e1e1e; margin-bottom: 8px; padding: 12px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; gap: 10px; cursor: pointer; border-left: 4px solid transparent; }}
     .playlist li.active {{ border-left-color: #d32f2f; background: #2a2020; }}
@@ -140,7 +152,6 @@ def build_player_html(today_str, news_items):
     document.getElementById("now-playing").textContent = "放送中: " + item.station + " - " + item.title;
     document.getElementById("script-box").textContent = item.script;
 
-    // 映像とMP3音声を同時に頭出し再生
     if (player && player.loadVideoById) {{
       player.loadVideoById({{ videoId: item.videoId, startSeconds: 0 }});
       player.setVolume(document.getElementById("orig-vol").value);
@@ -169,7 +180,6 @@ def build_player_html(today_str, news_items):
     if (player && player.setVolume) player.setVolume(val);
   }}
 
-  // 日本語音声が終わったら自動的に次の局の映像＆音声へ切り替え
   audioEl.addEventListener("ended", () => {{
     nextTrack();
   }});
@@ -192,87 +202,44 @@ def main():
     for label, channel_id in CHANNELS.items():
         station_display = label.split("_", 1)[1].replace("_", " ")
         try:
+            # 直近10件から「しっかり字幕（内容）がある本編ニュース」を探す
             res = youtube.search().list(
                 part="snippet",
                 channelId=channel_id,
                 order="date",
                 type="video",
-                maxResults=5
+                videoDuration="medium",  # 4分〜20分の本編ニュースを優先取得（ショート動画を完全除外）
+                maxResults=8
             ).execute()
 
-            target_item = None
-            for item in res.get("items", []):
-                if item["snippet"].get("liveBroadcastContent") == "none":
-                    target_item = item
+            items = res.get("items", [])
+            # mediumで見つからない局は全長さから再検索
+            if not items:
+                res = youtube.search().list(
+                    part="snippet",
+                    channelId=channel_id,
+                    order="date",
+                    type="video",
+                    maxResults=8
+                ).execute()
+                items = res.get("items", [])
+
+            selected_item = None
+            raw_text = None
+
+            for item in items:
+                if item["snippet"].get("liveBroadcastContent") != "none":
+                    continue
+                vid = item["id"]["videoId"]
+                text = fetch_full_transcript(vid)
+                # 400文字以上のしっかりしたニュース原稿が取れた動画のみ採用
+                if text and len(text) >= 400:
+                    selected_item = item
+                    raw_text = text
                     break
 
-            if not target_item:
+            if not selected_item or not raw_text:
+                print(f"十分な字幕付きの動画なし（スキップ）: {label}")
                 continue
 
-            vid = target_item["id"]["videoId"]
-            title_orig = target_item["snippet"]["title"]
-            title_ja = translate_to_japanese(title_orig)
-
-            raw_text = fetch_transcript_text(vid)
-            if raw_text and len(raw_text) > 100:
-                body_ja = translate_to_japanese(raw_text)
-                script = f"{station_display}のニュースです。{title_ja}。{body_ja}"
-            else:
-                script = f"{station_display}のヘッドラインです。{title_ja}。"
-
-            audio_rel_path = f"audio/{label}.mp3"
-            asyncio.run(generate_audio(script, audio_rel_path))
-
-            news_items.append({
-                "station": station_display,
-                "title": title_ja,
-                "videoId": vid,
-                "audioUrl": audio_rel_path,
-                "script": script
-            })
-            program_list_html.append(f"<li><strong>{station_display}</strong>: {title_ja}</li>")
-            print(f"生成完了: {label}")
-
-        except Exception as e:
-            print(f"スキップ ({label}): {e}")
-
-    if not news_items:
-        print("ニュースが取得できませんでした。")
-        return
-
-    # 同時再生プレイヤーHTMLを書き出し
-    html_content = build_player_html(today_str, news_items)
-    with open("index.html", "w", encoding="utf-8") as f:
-        f.write(html_content)
-
-    # メール送信
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"【同時スタート再生対応】朝のワールドニュース ({today_str})"
-    msg["From"] = EMAIL_USER
-    msg["To"] = EMAIL_USER
-
-    email_html = f"""
-    <html>
-      <body style="font-family: sans-serif; line-height: 1.6;">
-        <h2>{today_str} 世界の朝刊（映像・日本語音声 同時スタート版）</h2>
-        <p>下の赤いボタンを押して専用プレイヤーを開き、再生ボタンを押すと<strong>YouTubeのニュース映像と日本語音声が同時にスタート</strong>します。</p>
-        <p style="margin: 20px 0;">
-          <a href="{PLAYER_URL}" style="background-color: #d32f2f; color: white; padding: 14px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
-            ▶ 映像＋日本語音声 同時再生プレイヤーを開く
-          </a>
-        </p>
-        <h3>本日のラインナップ</h3>
-        <ul>{''.join(program_list_html)}</ul>
-      </body>
-    </html>
-    """
-    msg.attach(MIMEText(email_html, "html", "utf-8"))
-
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(EMAIL_USER, EMAIL_PASS)
-        server.send_message(msg)
-
-    print("同時スタートプレイヤーの生成とメール送信が完了しました！")
-
-if __name__ == "__main__":
-    main()
+            vid = selected_item["id"]["videoId"]
