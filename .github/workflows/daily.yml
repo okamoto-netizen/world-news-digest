@@ -5,9 +5,6 @@ on:
     - cron: '0 20 * * *'
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
   run-news:
     runs-on: ubuntu-latest
@@ -20,17 +17,12 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install FFmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
-
       - name: Install Python dependencies
-        run: pip install google-api-python-client yt-dlp youtube-transcript-api deep-translator edge-tts requests
+        run: pip install google-api-python-client youtube-transcript-api deep-translator edge-tts
 
       - name: Run script
         env:
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
         run: python main.py
