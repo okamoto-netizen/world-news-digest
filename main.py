@@ -34,7 +34,6 @@ PLAYER_URL = "https://okamoto-netizen.github.io/world-news-digest/"
 
 
 def fetch_full_transcript(video_id):
-    """動画全体（最大約6分・4500文字分）の字幕テキストをしっかり取得する"""
     try:
         transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
         transcript = next(iter(transcript_list))
@@ -47,7 +46,6 @@ def fetch_full_transcript(video_id):
 
 
 def translate_long_text(text):
-    """長文を1,500文字ずつに分割して確実に日本語へ翻訳する"""
     if not text:
         return ""
     chunks = [text[i:i + 1500] for i in range(0, len(text), 1500)]
@@ -67,34 +65,103 @@ async def generate_audio(script_text, output_path):
     await communicate.save(output_path)
 
 
-def build_player_html(today_str, news_items):
-    """YouTube映像とMP3音声を同時スタート・連続再生するWebプレイヤーを生成する"""
+def main():
+    youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
+    jst = timezone(timedelta(hours=9))
+    today_str = datetime.now(jst).strftime("%Y年%m月%d日")
+
+    os.makedirs("audio", exist_ok=True)
+    for old_mp3 in glob.glob("audio/*.mp3"):
+        os.remove(old_mp3)
+
+    news_items = []
+    program_list_html = []
+
+    for label, channel_id in CHANNELS.items():
+        station_display = label.split("_", 1)[1].replace("_", " ")
+        try:
+            res = youtube.search().list(
+                part="snippet",
+                channelId=channel_id,
+                order="date",
+                type="video",
+                maxResults=10
+            ).execute()
+
+            selected_item = None
+            raw_text = None
+
+            for item in res.get("items", []):
+                if item["snippet"].get("liveBroadcastContent") != "none":
+                    continue
+                vid = item["id"]["videoId"]
+                text = fetch_full_transcript(vid)
+                if text and len(text) >= 400:
+                    selected_item = item
+                    raw_text = text
+                    break
+
+            if not selected_item or not raw_text:
+                print(f"十分な字幕付きの動画なし（スキップ）: {label}")
+                continue
+
+            vid = selected_item["id"]["videoId"]
+            title_orig = selected_item["snippet"]["title"]
+            title_ja = translate_long_text(title_orig)
+            body_ja = translate_long_text(raw_text)
+
+            script = f"{station_display}のニュースです。{title_ja}。\n{body_ja}"
+
+            audio_rel_path = f"audio/{label}.mp3"
+            asyncio.run(generate_audio(script, audio_rel_path))
+
+            news_items.append({
+                "station": station_display,
+                "title": title_ja,
+                "videoId": vid,
+                "audioUrl": audio_rel_path,
+                "script": script
+            })
+            program_list_html.append(f"<li><strong>{station_display}</strong>: {title_ja}</li>")
+            print(f"詳細ニュース生成完了 ({len(body_ja)}文字): {label}")
+
+        except Exception as e:
+            print(f"スキップ ({label}): {e}")
+
+    if not news_items:
+        print("ニュースが取得できませんでした。")
+        return
+
+    with open("player.html", "r", encoding="utf-8") as f:
+        template = f.read()
+
     items_json = json.dumps(news_items, ensure_ascii=False)
-    return f"""<!DOCTYPE html>
-<html lang="ja">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>世界の朝刊 同時通訳プレイヤー ({today_str})</title>
-  <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #121212; color: #f5f5f5; margin: 0; padding: 16px; }}
-    .container {{ max-width: 820px; margin: 0 auto; }}
-    h1 {{ font-size: 1.3rem; margin-bottom: 12px; color: #fff; }}
-    .video-box {{ position: relative; width: 100%; padding-top: 56.25%; background: #000; border-radius: 8px; overflow: hidden; }}
-    #yt-player {{ position: absolute; top: 0; left: 0; width: 100%; height: 100%; }}
-    .controls {{ display: flex; flex-wrap: wrap; gap: 10px; margin: 14px 0; align-items: center; background: #1e1e1e; padding: 12px; border-radius: 8px; }}
-    button {{ background: #d32f2f; color: white; border: none; padding: 10px 18px; border-radius: 6px; font-size: 0.95rem; font-weight: bold; cursor: pointer; }}
-    button.secondary {{ background: #333; }}
-    button:hover {{ opacity: 0.9; }}
-    .now-playing {{ font-size: 0.95rem; color: #ff8a80; font-weight: bold; margin-bottom: 8px; }}
-    .script-box {{ background: #1e1e1e; padding: 14px; border-radius: 8px; font-size: 0.95rem; line-height: 1.7; color: #eee; margin-bottom: 16px; max-height: 220px; overflow-y: auto; }}
-    .playlist {{ list-style: none; padding: 0; margin: 0; }}
-    .playlist li {{ background: #1e1e1e; margin-bottom: 8px; padding: 12px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; gap: 10px; cursor: pointer; border-left: 4px solid transparent; }}
-    .playlist li.active {{ border-left-color: #d32f2f; background: #2a2020; }}
-    .station {{ font-size: 0.8rem; color: #aaa; }}
-    .title {{ font-size: 0.95rem; font-weight: bold; margin-top: 2px; }}
-  </style>
-</head>
-<body>
-<div class="container">
-  <h1>🌍 世界の朝刊 NHK風同時通訳プレイヤー ({today_str})
+    html_content = template.replace("__NEWS_DATA__", items_json).replace("__TODAY_STR__", today_str)
+
+    with open("index.html", "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"【詳細解説版・同時再生】朝のワールドニュース ({today_str})"
+    msg["From"] = EMAIL_USER
+    msg["To"] = EMAIL_USER
+
+    body_lines = [
+        f"<h2>{today_str} 世界の朝刊（詳細ニュース・同時再生版）</h2>",
+        "<p>ショート動画を除外し、各局の本編ニュース（最大約6分間の内容）を日本語翻訳・音声化しました。</p>",
+        f'<p style="margin: 20px 0;"><a href="{PLAYER_URL}" style="background-color: #d32f2f; color: white; padding: 14px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">▶ 映像＋日本語音声 同時再生プレイヤーを開く</a></p>',
+        "<h3>本日のラインナップ</h3>",
+        f"<ul>{''.join(program_list_html)}</ul>"
+    ]
+    email_html = "<html><body style='font-family: sans-serif; line-height: 1.6;'>" + "".join(body_lines) + "</body></html>"
+    msg.attach(MIMEText(email_html, "html", "utf-8"))
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(EMAIL_USER, EMAIL_PASS)
+        server.send_message(msg)
+
+    print("詳細解説版の生成とメール送信が完了しました！")
+
+
+if __name__ == "__main__":
+    main()
